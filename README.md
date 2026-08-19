@@ -1,0 +1,2 @@
+# skripsi
+bismillah lancar
