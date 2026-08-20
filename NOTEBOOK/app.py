@@ -16,6 +16,7 @@ import joblib
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 # ------------------------------------------------------------------------------
@@ -1883,179 +1884,346 @@ def save_uploaded_dataset(
         "total_rows": int(total_rows),
     }
 
+
+def build_model_input(
+    features,
+    selected_station,
+    selected_date,
+    lag_1,
+    lag_7,
+):
+    input_dataframe = pd.DataFrame(
+        0.0,
+        index=[0],
+        columns=features,
+    )
+
+    day_of_week = selected_date.weekday()
+    iso_calendar = selected_date.isocalendar()
+
+    feature_values = {
+        "day_of_week": day_of_week,
+        "dayofweek": day_of_week,
+        "weekday": day_of_week,
+        "month": selected_date.month,
+        "year": selected_date.year,
+        "day": selected_date.day,
+        "day_of_month": selected_date.day,
+        "week_of_year": int(iso_calendar.week),
+        "weekofyear": int(iso_calendar.week),
+        "quarter": ((selected_date.month - 1) // 3) + 1,
+        "is_weekend": int(day_of_week >= 5),
+        "lag_1": lag_1,
+        "lag1": lag_1,
+        "lag_7": lag_7,
+        "lag7": lag_7,
+        "stasiun_encoded": STATION_LABEL_MAPPING[selected_station],
+        "station_encoded": STATION_LABEL_MAPPING[selected_station],
+    }
+
+    for feature_name, feature_value in feature_values.items():
+        if feature_name in input_dataframe.columns:
+            input_dataframe.loc[0, feature_name] = feature_value
+
+    compact_selected_station = re.sub(
+        r"[^A-Z0-9]",
+        "",
+        selected_station.upper(),
+    )
+
+    for column in input_dataframe.columns:
+        compact_column = re.sub(
+            r"[^A-Z0-9]",
+            "",
+            str(column).upper(),
+        )
+
+        if (
+            compact_selected_station in compact_column
+            and (
+                "STASIUN" in compact_column
+                or "STATION" in compact_column
+            )
+        ):
+            input_dataframe.loc[0, column] = 1.0
+
+    return input_dataframe
+
+
+
 def render_excel_importer():
-    """Menampilkan antarmuka upload Excel dengan mode upsert otomatis."""
-    st.markdown("### Form Import Dataset")
+    """
+    Import dataset sebagai TESTING DATASET.
+    Dataset hanya diproses sementara:
+    upload -> preprocessing -> feature engineering -> prediksi -> evaluasi.
+    Tidak menyimpan data ke greenline.db.
+    """
+
+    st.markdown("### Import Dataset Testing Model")
 
     st.caption(
-        "Unggah file Excel untuk menambahkan data baru atau memperbarui "
-        "data yang sudah ada. Sistem mencocokkan kombinasi nama stasiun "
-        "dan tanggal secara otomatis. Proses ini tidak melatih ulang model."
+        "Upload dataset baru untuk menguji performa model tanpa mengubah "
+        "database utama."
     )
 
     st.info(
-        "Mode import otomatis: data baru ditambahkan, sedangkan data dengan "
-        "stasiun dan tanggal yang sama akan diperbarui. Data historis lain "
-        "tetap dipertahankan."
+        "Dataset yang diupload hanya digunakan pada sesi ini. "
+        "Tidak ada INSERT, UPDATE, atau perubahan pada greenline.db."
     )
 
     uploaded_file = st.file_uploader(
-        "Pilih file Excel",
+        "Pilih file Excel Testing",
         type=["xlsx", "xls"],
         accept_multiple_files=False,
+        key="greenline_testing_uploader",
         help=(
             "Kolom wajib: tanggal, nama_stasiun, "
-            "penumpang_berangkat_komuter, "
-            "penumpang_datang_komuter."
+            "penumpang_berangkat_komuter, penumpang_datang_komuter."
         ),
-        key="greenline_excel_uploader",
     )
 
     if uploaded_file is None:
-        st.info(
-            "Pilih file Excel untuk menampilkan validasi dan pratinjau."
-        )
+        st.info("Upload file Excel untuk menjalankan preprocessing dan evaluasi.")
         return
 
     try:
-        raw_upload_dataframe = pd.read_excel(
-            uploaded_file,
-            sheet_name=0,
-        )
-    except ImportError as error:
-        st.error(
-            "Library pembaca Excel belum lengkap. Jalankan: "
-            "`pip install openpyxl xlrd`."
-        )
-        st.exception(error)
-        return
-    except Exception as error:
-        st.error(
-            f"File Excel gagal dibaca: {error}"
-        )
-        return
+        raw_dataframe = pd.read_excel(uploaded_file, sheet_name=0)
 
-    try:
         (
-            cleaned_upload_dataframe,
-            invalid_upload_dataframe,
-            upload_summary,
-        ) = clean_uploaded_dataset(
-            raw_upload_dataframe
-        )
+            cleaned_dataframe,
+            invalid_dataframe,
+            summary,
+        ) = clean_uploaded_dataset(raw_dataframe)
+
     except Exception as error:
-        st.error(
-            f"Validasi dataset gagal: {error}"
-        )
+        st.error(f"Preprocessing gagal: {error}")
         return
 
-    metric1, metric2, metric3, metric4 = st.columns(4)
-
-    metric1.metric(
-        "Baris Excel",
-        f"{upload_summary['raw_rows']:,}",
-    )
-
-    metric2.metric(
-        "Baris valid",
-        f"{upload_summary['valid_rows']:,}",
-    )
-
-    metric3.metric(
-        "Baris tidak valid",
-        f"{upload_summary['invalid_rows']:,}",
-    )
-
-    metric4.metric(
-        "Duplikasi di file",
-        f"{upload_summary['duplicate_rows']:,}",
-    )
-
-    if not invalid_upload_dataframe.empty:
-        st.error(
-            "Import dibatalkan karena terdapat baris yang tidak valid. "
-            "Perbaiki baris berikut di Excel lalu unggah kembali."
-        )
-
-        st.dataframe(
-            invalid_upload_dataframe[
-                [
-                    "baris_excel",
-                    "tanggal",
-                    "nama_stasiun_asli",
-                    "penumpang_berangkat_komuter",
-                    "penumpang_datang_komuter",
-                    "alasan_tidak_valid",
-                ]
-            ].head(100),
-            use_container_width=True,
-            hide_index=True,
-        )
+    if not invalid_dataframe.empty:
+        st.error("Dataset memiliki data tidak valid.")
+        st.dataframe(invalid_dataframe.head(100), use_container_width=True)
         return
 
-    st.success(
-        "Validasi berhasil. Dataset siap ditambahkan atau diperbarui."
-    )
+    # Format tanggal hasil import agar hanya menampilkan tanggal tanpa jam 00:00:00
+    # Data tetap dapat dikonversi kembali ke datetime saat proses prediksi.
+    cleaned_dataframe["tanggal"] = pd.to_datetime(
+        cleaned_dataframe["tanggal"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
 
-    st.write(
-        f"Periode upload: **{upload_summary['minimum_date']}** sampai "
-        f"**{upload_summary['maximum_date']}** | "
-        f"Jumlah stasiun: **{upload_summary['station_count']}**"
-    )
+    st.success("Preprocessing berhasil.")
 
-    with st.expander(
-        "Lihat pratinjau data yang akan disimpan",
-        expanded=True,
-    ):
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("Total Data", f"{summary['valid_rows']:,}")
+    c2.metric("Jumlah Stasiun", summary["station_count"])
+    c3.metric("Tanggal Awal", summary["minimum_date"])
+    c4.metric("Tanggal Akhir", summary["maximum_date"])
+
+    with st.expander("Preview Dataset Testing"):
         st.dataframe(
-            cleaned_upload_dataframe.head(100),
+            cleaned_dataframe.head(100),
             use_container_width=True,
             hide_index=True,
         )
 
-        if len(cleaned_upload_dataframe) > 100:
-            st.caption(
-                "Pratinjau menampilkan 100 baris pertama."
-            )
+    if rf_model is None:
+        st.error("Model belum tersedia.")
+        return
 
-    import_button = st.button(
-        "Tambahkan / Perbarui Database",
-        type="primary",
+    testing_dataframe = cleaned_dataframe.copy()
+
+    testing_dataframe["tanggal"] = pd.to_datetime(
+        testing_dataframe["tanggal"]
+    )
+
+    predictions = []
+    actual_values = []
+
+    progress = st.progress(0)
+
+    total_rows = len(testing_dataframe)
+
+    for index, row in testing_dataframe.iterrows():
+
+        station = row["nama_stasiun"]
+        date = row["tanggal"].date()
+
+        history = testing_dataframe[
+            (testing_dataframe["nama_stasiun"] == station)
+            & (testing_dataframe["tanggal"] < row["tanggal"])
+        ]
+
+        lag_1_data = history[
+            history["tanggal"] == row["tanggal"] - pd.Timedelta(days=1)
+        ]
+
+        lag_7_data = history[
+            history["tanggal"] == row["tanggal"] - pd.Timedelta(days=7)
+        ]
+
+        if lag_1_data.empty or lag_7_data.empty:
+            predictions.append(None)
+            actual_values.append(row["volume_penumpang"])
+            continue
+
+        lag_1 = float(
+            lag_1_data.iloc[-1]["volume_penumpang"]
+        )
+
+        lag_7 = float(
+            lag_7_data.iloc[-1]["volume_penumpang"]
+        )
+
+        model_input = build_model_input(
+            features=model_features,
+            selected_station=station,
+            selected_date=date,
+            lag_1=lag_1,
+            lag_7=lag_7,
+        )
+
+        prediction = float(
+            rf_model.predict(model_input)[0]
+        )
+
+        predictions.append(max(0, prediction))
+        actual_values.append(row["volume_penumpang"])
+
+        progress.progress(
+            min((index + 1) / total_rows, 1.0)
+        )
+
+    result_dataframe = testing_dataframe.copy()
+
+    result_dataframe["actual"] = actual_values
+    result_dataframe["prediction"] = predictions
+
+    result_dataframe = result_dataframe.dropna(
+        subset=["prediction"]
+    )
+
+    # Format tanggal hasil evaluasi agar tidak menampilkan jam 00:00:00
+    result_dataframe["tanggal"] = pd.to_datetime(
+        result_dataframe["tanggal"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+
+    # Membulatkan nilai prediksi agar tabel lebih mudah dibaca
+    result_dataframe["prediction"] = (
+        result_dataframe["prediction"]
+        .round(0)
+        .astype(int)
+    )
+
+    if result_dataframe.empty:
+        st.warning(
+            "Tidak ada data yang memiliki lag H-1 dan H-7 lengkap "
+            "untuk evaluasi."
+        )
+        return
+
+    mae = mean_absolute_error(
+        result_dataframe["actual"],
+        result_dataframe["prediction"],
+    )
+
+    mse = mean_squared_error(
+        result_dataframe["actual"],
+        result_dataframe["prediction"],
+    )
+    rmse = mse ** 0.5
+
+    r2 = r2_score(
+        result_dataframe["actual"],
+        result_dataframe["prediction"],
+    )
+
+    st.markdown("## Hasil Evaluasi Dataset Testing")
+
+    m1, m2, m3 = st.columns(3)
+
+    m1.metric(
+        "MAE",
+        f"{mae:,.2f}"
+    )
+
+    m2.metric(
+        "RMSE",
+        f"{rmse:,.2f}"
+    )
+
+    m3.metric(
+        "R²",
+        f"{r2:.4f}"
+    )
+
+    # Interpretasi otomatis hasil evaluasi model
+    if r2 >= 0.90:
+        model_quality = "sangat baik"
+    elif r2 >= 0.75:
+        model_quality = "baik"
+    elif r2 >= 0.50:
+        model_quality = "cukup"
+    else:
+        model_quality = "perlu perbaikan"
+
+    st.markdown(
+        f"""
+<div class="model-conclusion-card">
+    <div class="model-conclusion-title">
+        Interpretasi Hasil Evaluasi Dataset Testing
+    </div>
+
+
+        Berdasarkan hasil pengujian menggunakan dataset testing,
+        model menghasilkan nilai MAE sebesar {mae:,.2f}
+        Nilai tersebut menunjukkan bahwa rata-rata selisih antara hasil
+        prediksi dengan data aktual berada pada kisaran
+        {mae:,.2f} penumpang
+
+        Nilai RMSE sebesar {rmse:,.2f}menunjukkan tingkat kesalahan
+        prediksi dengan memberikan penalti lebih besar terhadap kesalahan
+        yang bernilai ekstrem. Perbedaan nilai antara MAE dan RMSE
+        menunjukkan bahwa terdapat beberapa data dengan selisih prediksi
+        yang lebih besar.
+
+        Model memperoleh nilai R² sebesar {r2:.4f}, yang berarti model
+        mampu menjelaskan sekitar {r2*100:.2f}% variasi perubahan
+        volume penumpang berdasarkan pola data historis yang digunakan.
+
+        Secara keseluruhan, performa model dapat dikategorikan
+        {model_quality}. Model mampu menangkap pola historis data
+        dengan baik dan dapat digunakan sebagai alat bantu prediksi
+        volume penumpang KRL.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### Actual vs Prediction")
+
+    st.dataframe(
+        result_dataframe[
+            [
+                "tanggal",
+                "nama_stasiun",
+                "actual",
+                "prediction",
+            ]
+        ],
         use_container_width=True,
+        hide_index=True,
     )
 
-    if not import_button:
-        return
+    csv = result_dataframe.to_csv(index=False)
 
-    try:
-        backup_path = create_database_backup(
-            DATABASE_PATH
-        )
-
-        import_result = save_uploaded_dataset(
-            dataframe=cleaned_upload_dataframe,
-            database_path=DATABASE_PATH,
-        )
-
-        st.cache_data.clear()
-
-        st.session_state["database_import_success"] = {
-            "filename": uploaded_file.name,
-            "inserted_count": import_result["inserted_count"],
-            "updated_count": import_result["updated_count"],
-            "total_rows": import_result["total_rows"],
-            "backup_path": (
-                str(backup_path)
-                if backup_path is not None
-                else None
-            ),
-        }
-
-        st.rerun()
-    except Exception as error:
-        st.error(
-            f"Import ke database gagal: {error}"
-        )
+    st.download_button(
+        "Download Hasil Evaluasi",
+        csv,
+        file_name="hasil_testing_model.csv",
+        mime="text/csv",
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -2567,71 +2735,6 @@ def format_absolute_percentage(value):
         return "N/A"
 
     return f"{abs(value):.2f}%".replace(".", ",")
-
-
-def build_model_input(
-    features,
-    selected_station,
-    selected_date,
-    lag_1,
-    lag_7,
-):
-    input_dataframe = pd.DataFrame(
-        0.0,
-        index=[0],
-        columns=features,
-    )
-
-    day_of_week = selected_date.weekday()
-    iso_calendar = selected_date.isocalendar()
-
-    feature_values = {
-        "day_of_week": day_of_week,
-        "dayofweek": day_of_week,
-        "weekday": day_of_week,
-        "month": selected_date.month,
-        "year": selected_date.year,
-        "day": selected_date.day,
-        "day_of_month": selected_date.day,
-        "week_of_year": int(iso_calendar.week),
-        "weekofyear": int(iso_calendar.week),
-        "quarter": ((selected_date.month - 1) // 3) + 1,
-        "is_weekend": int(day_of_week >= 5),
-        "lag_1": lag_1,
-        "lag1": lag_1,
-        "lag_7": lag_7,
-        "lag7": lag_7,
-        "stasiun_encoded": STATION_LABEL_MAPPING[selected_station],
-        "station_encoded": STATION_LABEL_MAPPING[selected_station],
-    }
-
-    for feature_name, feature_value in feature_values.items():
-        if feature_name in input_dataframe.columns:
-            input_dataframe.loc[0, feature_name] = feature_value
-
-    compact_selected_station = re.sub(
-        r"[^A-Z0-9]",
-        "",
-        selected_station.upper(),
-    )
-
-    for column in input_dataframe.columns:
-        compact_column = re.sub(
-            r"[^A-Z0-9]",
-            "",
-            str(column).upper(),
-        )
-
-        if (
-            compact_selected_station in compact_column
-            and (
-                "STASIUN" in compact_column
-                or "STATION" in compact_column
-            )
-        ):
-            input_dataframe.loc[0, column] = 1.0
-
-    return input_dataframe
 
 
 def resolve_prediction_lags(
